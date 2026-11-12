@@ -1,7 +1,3 @@
-//! DM-MC02 (STM32H723VG) board setup: clocks, CAN1, DR16 input, watchdog and panic handling.
-//!
-//! The CPU runs at 520 MHz from the 24 MHz crystal. TIM2 is Embassy's time driver.
-
 use core::fmt::Write as _;
 use core::num::{NonZeroU8, NonZeroU16};
 use core::panic::PanicInfo;
@@ -34,12 +30,10 @@ pub type Can1 = BufferedCan<'static, 4, 16>;
 static CAN_TX: StaticCell<TxBuf<4>> = StaticCell::new();
 static CAN_RX: StaticCell<RxBuf<16>> = StaticCell::new();
 
-/// CAN bus errors reported to `log_can_error` since startup.
 pub static CAN_ERRORS: AtomicU32 = AtomicU32::new(0);
 
 pub type Watchdog = IndependentWatchdog<'static, embassy_stm32::peripherals::IWDG1>;
 
-/// Nominal; the LSI clock varies with voltage and temperature.
 const WATCHDOG_TIMEOUT_US: u32 = 100_000;
 
 bind_interrupts!(struct Irqs {
@@ -49,12 +43,7 @@ bind_interrupts!(struct Irqs {
     FDCAN1_IT1 => can::IT1InterruptHandler<embassy_stm32::peripherals::FDCAN1>;
 });
 
-/// Take the MCU peripherals and return CAN1, the started watchdog and the DR16 receiver.
-/// Call once at startup. Power the board from USB or its normal input: probe power alone
-/// does not power the CAN transceivers.
 pub fn init() -> (Can1, Watchdog, RemoteRx) {
-    // After a watchdog reset, halt before CAN starts. Clearing the reset flags first lets
-    // the next manual reset run normally.
     let watchdog_reset = pac::RCC.rsr().read().iwdg1rstf();
     pac::RCC.rsr().modify(|w| w.set_rmvf(true));
     if watchdog_reset {
@@ -65,8 +54,6 @@ pub fn init() -> (Can1, Watchdog, RemoteRx) {
         }
     }
 
-    // 24 MHz / 3 * 65 = 520 MHz, the VOS0 limit without the CPU boost option bit.
-    // AHB runs at 260 MHz and every APB at 130 MHz. CAN takes the crystal directly.
     let mut config = embassy_stm32::Config::default();
     config.rcc.hse = Some(Hse {
         freq: Hertz(24_000_000),
@@ -90,11 +77,9 @@ pub fn init() -> (Can1, Watchdog, RemoteRx) {
     config.rcc.mux.fdcansel = Fdcansel::HSE;
     let p = embassy_stm32::init(config);
 
-    // Only the control task feeds this, after each completed tick.
     let mut watchdog = Watchdog::new(p.IWDG1, WATCHDOG_TIMEOUT_US);
     watchdog.unleash();
 
-    // Classic CAN on PD0 (RX) and PD1 (TX): 24 MHz / (1 + 17 + 6) = 1 Mbit/s, sampled at 75%.
     let mut can = CanConfigurator::new(p.FDCAN1, p.PD0, p.PD1, Irqs);
     can.set_config(can.config().set_nominal_bit_timing(NominalBitTiming {
         prescaler: NonZeroU16::new(1).unwrap(),
@@ -106,18 +91,16 @@ pub fn init() -> (Can1, Watchdog, RemoteRx) {
         .into_normal_mode()
         .buffered(CAN_TX.init(TxBuf::new()), CAN_RX.init(RxBuf::new()));
 
-    // DBUS on PD2: 100 kbaud, 8E2. The board inverts the signal, so the UART does not.
     let mut remote_config = usart::Config::default();
     remote_config.baudrate = 100_000;
     remote_config.parity = Parity::ParityEven;
     remote_config.stop_bits = StopBits::STOP2;
     let remote = UartRx::new(p.UART5, p.PD2, p.DMA1_CH5, Irqs, remote_config).unwrap();
-    // PC15 switches the 5 V rail that powers the receiver.
+
     core::mem::forget(Output::new(p.PC15, Level::High, Speed::Low));
     (can, watchdog, remote)
 }
 
-/// Count a CAN bus error, and log the first one and every 1000th after it.
 pub fn log_can_error(error: BusError) {
     let count = CAN_ERRORS.fetch_add(1, Ordering::Relaxed) + 1;
     if count == 1 || count % 1000 == 0 {
@@ -125,23 +108,20 @@ pub fn log_can_error(error: BusError) {
     }
 }
 
-/// One valid 18-byte DBUS frame, without remapping or deadzones.
 #[derive(Clone, Copy)]
 pub struct Dr16 {
-    /// Right horizontal, right vertical, left horizontal, left vertical, wheel; -660..=660.
     pub channels: [i16; 5],
-    /// 1 up, 2 down, 3 middle.
+
     pub right_switch: u8,
     pub left_switch: u8,
     pub mouse: [i16; 3],
     pub mouse_left: bool,
     pub mouse_right: bool,
-    /// Bits 0..15: W S A D Shift Ctrl Q E R F G Z X C V B.
+
     pub keys: u16,
 }
 
 impl Dr16 {
-    /// Returns `None` for partial frames and out-of-range channels or switches.
     pub fn parse(bytes: &[u8]) -> Option<Self> {
         let b: &[u8; 18] = bytes.try_into().ok()?;
         let u = |i: usize| u16::from(b[i]);
@@ -174,10 +154,8 @@ impl Dr16 {
     }
 }
 
-/// Split DBUS frames at UART idle and publish only the latest one.
 #[embassy_executor::task]
 pub async fn remote_task(mut rx: RemoteRx) {
-    // Twice a frame, so a read that fills the buffer shows a missing idle gap.
     let mut bytes = [0; 36];
     loop {
         match rx.read_until_idle(&mut bytes).await {
@@ -190,8 +168,6 @@ pub async fn remote_task(mut rx: RemoteRx) {
     }
 }
 
-/// Program IWDG1 directly, since the control task owns the HAL watchdog. At the nominal
-/// 32 kHz LSI, reload 799 is 100 ms and reload 0 is 125 us.
 fn configure_panic_watchdog(reload: u16) {
     use pac::iwdg::vals::{Key, Pr};
 
@@ -209,8 +185,6 @@ fn configure_panic_watchdog(reload: u16) {
     wdg.kr().write(|w| w.set_key(Key::RESET));
 }
 
-/// Disable interrupts, give the probe up to 100 ms to read the message, then reset through
-/// the watchdog. The next boot halts in `init` until a manual reset.
 #[panic_handler]
 fn panic(info: &PanicInfo<'_>) -> ! {
     static PANICKED: AtomicBool = AtomicBool::new(false);

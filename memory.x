@@ -1,4 +1,4 @@
-/* STM32H723VG: 1 MiB flash and 128 KiB of AXI SRAM available in either RAM partition. */
+
 MEMORY
 {
     FLASH : ORIGIN = 0x08000000, LENGTH = 1024K
